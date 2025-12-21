@@ -1,0 +1,70 @@
+[package]
+name = "topolog-embed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Topology-preserving embeddings in Rust: whitening, parametric UMAP, ... with Lance storage."
+repository = "https://github.com/tuned-org-uk/topolog-embeddings"
+
+exclude = [
+    "target/*",
+    "Cargo.lock",
+    ".git/*",
+    ".github/*",
+    "*.tmp",
+    "*.md",
+    "*.bib",
+    "*.cff",
+    "test_data/*",
+    "examples/*"
+]
+[dependencies]
+# Burn with default CPU + optional GPU backends
+burn = { version = "0.18", default-features = false, features = ["std", "train"] }
+burn-ndarray = { version = "0.18", optional = true }
+burn-wgpu = { version = "0.18", optional = true }
+burn-cuda = { version = "0.18", optional = true }
+
+# Core dependencies
+ndarray = { version = "0.16.1", optional = true }
+anyhow = "1.0"
+rmp-serde = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+tokenizers = "0.22.1"
+env_logger = "0.11.8"
+log = "0.4.28"
+tempfile = "3.23.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+genegraph-storage = { version = "0.10.0" }
+smartcore = "0.4"
+
+
+[features]
+default = ["cpu"]
+cpu = ["burn-ndarray", "ndarray"]
+wgpu = ["burn-wgpu"]
+cuda = ["burn-cuda"]
+
+# Convenience feature for all backends
+all-backends = ["cpu", "wgpu", "cuda"]
+
+[lib]
+name = "topolog_embed"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "topolog-embed"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1  # Faster dev builds
+
+[dev-dependencies]
+tokio-test = "0.4"
