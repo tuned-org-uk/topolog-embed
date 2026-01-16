@@ -78,9 +78,36 @@ def encode_texts(
         show_progress_bar=True,
         normalize_embeddings=True,  # cosine-friendly baseline
     )
-    # ArrowSpace in your CVE script scales embeddings to keep eps/sigma meaningful. [file:42]
+    # ArrowSpace scales embeddings to keep eps/sigma meaningful.
     # Keep it explicit and configurable:
-    return emb.astype(np.float64)
+    return emb.astype(np.float64) * 12.0  
+
+
+def encode_texts_cached(
+    model: SentenceTransformer,
+    texts: List[str],
+    cache_path: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """
+    Loads embeddings from cache_path if present and shape matches.
+    Otherwise computes, saves, and returns.
+    """
+    if os.path.exists(cache_path):
+        X = np.load(cache_path)
+        if X.shape[0] == len(texts):
+            print(f"Loaded cached embeddings: {cache_path} shape={X.shape}")
+            return X
+        print(
+            f"Cache mismatch for {cache_path}: "
+            f"cache has {X.shape[0]} rows but texts={len(texts)}. Regenerating..."
+        )
+
+    X = encode_texts(model, texts, batch_size=batch_size)
+    np.save(cache_path, X)
+    print(f"Saved embeddings: {cache_path} shape={X.shape}")
+    return X
+
 
 
 # ----------------------------
@@ -132,6 +159,7 @@ def evaluate_queries(
     n = len(query_ids)
 
     for i, qid in enumerate(tqdm(query_ids, desc=f"Searching tau={tau}")):
+        print(f"Query embeddings -> ", query_emb[i])
         res = aspace.search(query_emb[i], gl, tau=tau)  # returns [(index, score), ...] [file:42]
 
         # map ArrowSpace row indices → doc ids
@@ -158,23 +186,29 @@ def evaluate_queries(
 # Main pipeline
 # ----------------------------
 def main(workdir: str, model_name: str, tau_cosine: float, tau_eigen: float):
-    set_debug(True)  # same as your CVE test [file:42]
+    set_debug(True)
 
     workdir = os.path.abspath(workdir)
     os.makedirs(workdir, exist_ok=True)
 
     dataset = "scifact"
     datasets_dir = os.path.join(workdir, "datasets")
+    os.makedirs(datasets_dir, exist_ok=True)
 
-    print(f"[1] Downloading BEIR dataset: {dataset}")
-    data_path = download_beir_dataset(dataset, datasets_dir)  # [file:24]
-    print(f"    data_path={data_path}")
+    data_path = os.path.join(datasets_dir, dataset)
+
+    # If already downloaded, skip download_and_unzip.
+    # Otherwise download from BEIR mirror. [file:24]
+    if not os.path.isdir(data_path):
+        print(f"[1] Downloading BEIR dataset: {dataset}")
+        data_path = download_beir_dataset(dataset, datasets_dir)
+        print(f"    data_path={data_path}")
+    else:
+        print(f"[1] Using existing dataset at: {data_path}")
 
     print("[1b] Loading splits")
-    # SciFact has test split; dev may or may not be present depending on packaging.
     corpus, queries, qrels = load_beir_split(data_path, split="test")
 
-    # stable order for corpus → embedding rows
     doc_ids = list(corpus.keys())
     doc_texts = [build_text_for_doc(corpus[doc_id]) for doc_id in doc_ids]
 
@@ -183,57 +217,39 @@ def main(workdir: str, model_name: str, tau_cosine: float, tau_eigen: float):
 
     print(f"    docs={len(doc_ids)} queries={len(query_ids)} qrels={len(qrels)}")
 
-    print("[2] Creating embeddings")
+    print("[2] Creating / loading embeddings")
     model = SentenceTransformer(model_name)
-    X_docs = encode_texts(model, doc_texts, batch_size=64)
-    X_q = encode_texts(model, query_texts, batch_size=64)
 
-    # Optional scaling knob (your CVE script scaled by 12.0 to stabilize graph params). [file:42]
-    # For SciFact + normalized embeddings, start with no scaling.
-    # If you tune eps/sigma later and want larger magnitude, apply:
-    # X_docs *= 12.0
-    # X_q *= 12.0
+    doc_cache = os.path.join(workdir, "scifact_doc_embeddings.npy")
+    query_cache = os.path.join(workdir, "scifact_query_embeddings.npy")
+
+    X_docs = encode_texts_cached(model, doc_texts, cache_path=doc_cache, batch_size=64)
+    X_q = encode_texts_cached(model, query_texts, cache_path=query_cache, batch_size=64)
 
     emb_path = os.path.join(workdir, "scifact_doc_embeddings.npy")
     np.save(emb_path, X_docs)
     print(f"    Saved embeddings: {emb_path} shape={X_docs.shape}")
+    print("Sample: ", X_docs[0])
 
     print("[3] Build + store ArrowSpace manifold (eigenmaps)")
     # Start from reasonably safe graph params; SciFact is small so higher k is fine.
-    # Your CVE script uses keys: eps,k,topk,p,sigma. [file:42]
     graph_params = {
-        "eps": 0.25,   # for normalized embeddings, start smaller than CVE
-        "k": 15,
+        "eps": 0.95,    # Start near 0.25 and grow according to scale
+        "k": 25,        # higher to improve connectivity
         "topk": 15,
-        "p": 2.0,
-        "sigma": None  # let builder derive if supported; else set float like 0.25
+        "p": 1.5,       # Kernel sharpness
+        "sigma": None
     }
-
-    # Storage directory for manifold
-    manifold_dir = os.path.join(workdir, "arrowspace_scifact")
-    os.makedirs(manifold_dir, exist_ok=True)
 
     t0 = time.perf_counter()
 
-    # build_and_store usage is shown in your attached CVE script as "build" + later use. [file:42]
-    # Here we assume pyarrowspace exposes build_and_store; if your installed version only exposes
-    # build(), switch to ArrowSpaceBuilder.build(graph_params, X_docs). [file:42]
     aspace, gl = ArrowSpaceBuilder.build_and_store(
         graph_params=graph_params,
-        embeddings=X_docs,
-        out_dir=manifold_dir,
-        metadata={
-            "dataset": dataset,
-            "model": model_name,
-            "created_at_unix": int(time.time()),
-            "n_docs": int(X_docs.shape[0]),
-            "dim": int(X_docs.shape[1]),
-            "graph_params": graph_params,
-        },
+        items=X_docs,
     )
 
     dt = time.perf_counter() - t0
-    print(f"    Build+store done in {dt:.2f}s -> {manifold_dir}")
+    print(f"    Build+store done in {dt:.2f}s -> storage/ directory")
 
     print("[4] Tests + metrics: eigenmaps search behavior")
 
@@ -304,19 +320,23 @@ if __name__ == "__main__":
         default="sentence-transformers/all-MiniLM-L6-v2",
         help="SentenceTransformer model name or path.",
     )
-    ap.add_argument("--tau_cosine", type=float, default=1.0, help="tau=1.0 means pure cosine. [file:42]")
+    ap.add_argument("--tau_cosine", type=float, default=1.0, help="tau=1.0 means pure cosine.")
     ap.add_argument(
         "--tau_eigen",
         type=float,
-        default=0.72,
-        help="Spectral blend tau (smaller => more spectral). Matches your CVE-style usage. [file:42]",
+        default=0.52,
+        help="Spectral blend tau (smaller => more spectral). Matches your CVE-style usage.",
     )
     args = ap.parse_args()
 
-    main(
-        workdir=args.workdir,
-        model_name=args.model,
-        tau_cosine=args.tau_cosine,
-        tau_eigen=args.tau_eigen,
-    )
+    try:
+        main(
+            workdir=args.workdir,
+            model_name=args.model,
+            tau_cosine=args.tau_cosine,
+            tau_eigen=args.tau_eigen,
+        )
+    except KeyboardInterrupt:
+        import sys
+        sys.exit(0)
 

@@ -1,1 +1,3 @@
 /target
+python/beir/runs/
+python/beir/storage/
